@@ -1,3 +1,4 @@
+
 const TICK_MS = 1000;
 const ROAD_LENGTH = 100;
 const STOP_LINE = 35;
@@ -6,14 +7,30 @@ const CAR_GAP = 8;
 
 const MIN_GREEN = 5;
 const MAX_GREEN = 15;
-const ALL_RED_SECONDS = 1;
+
+const ALL_RED_SECONDS = 5;
+const OVERRIDE_LIMIT_SECONDS = 60;
+const EW_OVERRIDE_SECONDS = 30;
 
 let currentPhase = "NS";
 let transition = "GREEN";
+
 let phaseSeconds = 0;
 let transitionSeconds = 0;
+let overrideSeconds = 0;
+
+// Pending phase during all-red clearance.
+let pendingPhase = "NS";
+let overrideAfterClearance = false;
+
+// Green time accumulated since the last fairness override.
+let greenTime = {
+    NS: 0,
+    EW: 0
+};
 
 let vehicles = [];
+
 let signals = {
     North: "GREEN",
     South: "GREEN",
@@ -31,67 +48,7 @@ function chooseNextPhase() {
     return currentPhase === "NS" ? "EW" : "NS";
 }
 
-// Update signals and manage the green/all-red phases.
-function updateSignals(counts) {
-    if (transition === "GREEN") {
-        phaseSeconds++;
-
-        const ns = currentPhase === "NS";
-
-        const active = ns
-            ? counts.North + counts.South
-            : counts.East + counts.West;
-
-        const waiting = ns
-            ? counts.East + counts.West
-            : counts.North + counts.South;
-
-        // Switch at maximum green, or earlier if the other axis
-        // has more demand after minimum green has elapsed.
-        if (
-            phaseSeconds >= MAX_GREEN ||
-            (phaseSeconds >= MIN_GREEN && waiting > active)
-        ) {
-            transition = "ALL_RED";
-            transitionSeconds = 0;
-        }
-    } else if (transition === "ALL_RED") {
-        transitionSeconds++;
-
-        if (transitionSeconds >= ALL_RED_SECONDS) {
-            currentPhase = chooseNextPhase();
-            transition = "GREEN";
-            phaseSeconds = 0;
-            transitionSeconds = 0;
-        }
-    }
-
-    // During clearance, ALL four signals remain red.
-    if (transition === "GREEN") {
-        signals = currentPhase === "NS"
-            ? {
-                North: "GREEN",
-                South: "GREEN",
-                East: "RED",
-                West: "RED"
-            }
-            : {
-                North: "RED",
-                South: "RED",
-                East: "GREEN",
-                West: "GREEN"
-            };
-    } else {
-        signals = {
-            North: "RED",
-            South: "RED",
-            East: "RED",
-            West: "RED"
-        };
-    }
-}
-
-// Count vehicles on each approach.
+// Return the total number of vehicles on each approach.
 function currentCounts() {
     const counts = {
         North: 0,
@@ -117,12 +74,7 @@ function currentQueues() {
     };
 
     vehicles.forEach(vehicle => {
-        const atStopLine = vehicle.direction === "North" ||
-            vehicle.direction === "South"
-            ? vehicle.position <= STOP_LINE
-            : vehicle.position <= STOP_LINE;
-
-        if (atStopLine && vehicle.stopped) {
+        if (vehicle.stopped && vehicle.position >= STOP_LINE) {
             queues[vehicle.direction]++;
         }
     });
@@ -130,13 +82,156 @@ function currentQueues() {
     return queues;
 }
 
-// Add a vehicle to the selected road.
+// Check whether any E-W vehicles remain on the roads.
+// Vehicles past the stop line are included until they exit.
+function hasEWTraffic() {
+    return vehicles.some(vehicle =>
+        vehicle.direction === "East" ||
+        vehicle.direction === "West"
+    );
+}
+
+// Begin a normal all-red clearance before changing phases.
+function beginAllRed(nextPhase) {
+    transition = "ALL_RED";
+    transitionSeconds = 0;
+    pendingPhase = nextPhase;
+    overrideAfterClearance = false;
+}
+
+// Begin the fairness override.
+// If N-S is currently green, use the full red clearance.
+// If E-W is already green, convert directly to override mode.
+function triggerEWOverride() {
+    // Reset accumulated time so the same threshold cannot
+    // retrigger continuously after this override.
+    greenTime.NS = 0;
+    greenTime.EW = 0;
+
+    phaseSeconds = 0;
+    overrideSeconds = 0;
+
+    if (currentPhase === "EW") {
+        transition = "EW_OVERRIDE";
+    } else {
+        transition = "ALL_RED";
+        transitionSeconds = 0;
+        pendingPhase = "EW";
+        overrideAfterClearance = true;
+    }
+}
+
+// Update signal phases and timers.
+function updateSignals(counts) {
+    if (transition === "GREEN") {
+        phaseSeconds++;
+
+        // Accumulate green time for the currently active axis.
+        greenTime[currentPhase]++;
+
+        // FAIRNESS OVERRIDE:
+        // If either axis exceeds 60 seconds of accumulated
+        // normal green time, give E-W priority.
+        if (
+            greenTime.NS > OVERRIDE_LIMIT_SECONDS ||
+            greenTime.EW > OVERRIDE_LIMIT_SECONDS
+        ) {
+            triggerEWOverride();
+        } else {
+            const isNS = currentPhase === "NS";
+
+            const active = isNS
+                ? counts.North + counts.South
+                : counts.East + counts.West;
+
+            const waiting = isNS
+                ? counts.East + counts.West
+                : counts.North + counts.South;
+
+            // Normal adaptive signal switching.
+            if (
+                phaseSeconds >= MAX_GREEN ||
+                (
+                    phaseSeconds >= MIN_GREEN &&
+                    waiting > active
+                )
+            ) {
+                beginAllRed(chooseNextPhase());
+            }
+        }
+    } else if (transition === "ALL_RED") {
+        transitionSeconds++;
+
+        // Keep all signals red for the full five-second clearance.
+        if (transitionSeconds >= ALL_RED_SECONDS) {
+            currentPhase = pendingPhase;
+
+            phaseSeconds = 0;
+            transitionSeconds = 0;
+
+            if (overrideAfterClearance) {
+                transition = "EW_OVERRIDE";
+                overrideSeconds = 0;
+                overrideAfterClearance = false;
+            } else {
+                transition = "GREEN";
+            }
+        }
+    } else if (transition === "EW_OVERRIDE") {
+        // E-W has exclusive green priority during this window.
+        overrideSeconds++;
+
+        // End the override when either:
+        // 1. Thirty seconds have elapsed, OR
+        // 2. All E-W vehicles have cleared the roads.
+        if (
+            overrideSeconds >= EW_OVERRIDE_SECONDS ||
+            !hasEWTraffic()
+        ) {
+            // E-W is currently green, so use clearance before NS.
+            beginAllRed("NS");
+        }
+    }
+
+    // Apply the final signal states after transition handling.
+    if (transition === "ALL_RED") {
+        signals = {
+            North: "RED",
+            South: "RED",
+            East: "RED",
+            West: "RED"
+        };
+    } else if (
+        transition === "EW_OVERRIDE" ||
+        currentPhase === "EW"
+    ) {
+        signals = {
+            North: "RED",
+            South: "RED",
+            East: "GREEN",
+            West: "GREEN"
+        };
+    } else {
+        signals = {
+            North: "GREEN",
+            South: "GREEN",
+            East: "RED",
+            West: "RED"
+        };
+    }
+}
+
+// Add a vehicle to a selected road.
 function addVehicle(direction) {
+    const validDirections = ["North", "South", "East", "West"];
+
+    if (!validDirections.includes(direction)) return;
+
     const roadVehicles = vehicles.filter(
         vehicle => vehicle.direction === direction
     );
 
-    // Keep enough space between newly added vehicles.
+    // Keep space between vehicles entering the road.
     const hasSpace = roadVehicles.every(
         vehicle => vehicle.position > CAR_GAP
     );
@@ -151,11 +246,12 @@ function addVehicle(direction) {
     });
 }
 
-// Move vehicles according to signal state and spacing.
+// Move vehicles without crossing a red signal.
 function moveVehicles() {
     const directions = ["North", "South", "East", "West"];
 
     directions.forEach(direction => {
+        // Front vehicle first.
         const roadVehicles = vehicles
             .filter(vehicle => vehicle.direction === direction)
             .sort((a, b) => b.position - a.position);
@@ -163,42 +259,41 @@ function moveVehicles() {
         roadVehicles.forEach((vehicle, index) => {
             const vehicleAhead = roadVehicles[index - 1];
 
-            let nextPosition = vehicle.position + VEHICLE_SPEED;
+            let nextPosition =
+                vehicle.position + VEHICLE_SPEED;
 
-            // Do not let vehicles overlap.
-            if (
-                vehicleAhead &&
-                nextPosition > vehicleAhead.position - CAR_GAP
-            ) {
-                nextPosition = vehicleAhead.position - CAR_GAP;
+            // Prevent vehicles from overlapping.
+            if (vehicleAhead) {
+                nextPosition = Math.min(
+                    nextPosition,
+                    vehicleAhead.position - CAR_GAP
+                );
             }
 
-            // Stop at the stop line when the light is red.
-            if (
-                signals[direction] !== "GREEN" &&
-                vehicle.position < STOP_LINE &&
-                nextPosition >= STOP_LINE
-            ) {
-                nextPosition = STOP_LINE;
-            }
+            // Stop at the stop line if the light is not green.
+            if (signals[direction] !== "GREEN") {
+                if (
+                    vehicle.position < STOP_LINE &&
+                    nextPosition >= STOP_LINE
+                ) {
+                    nextPosition = STOP_LINE;
+                }
 
-            // Vehicles already at the stop line cannot cross red.
-            if (
-                signals[direction] !== "GREEN" &&
-                vehicle.position >= STOP_LINE
-            ) {
-                nextPosition = vehicle.position;
+                // Do not move a waiting vehicle on red.
+                if (vehicle.position >= STOP_LINE) {
+                    nextPosition = vehicle.position;
+                }
             }
 
             vehicle.position = nextPosition;
-            vehicle.stopped = (
+
+            vehicle.stopped =
                 signals[direction] !== "GREEN" &&
-                vehicle.position >= STOP_LINE
-            );
+                vehicle.position >= STOP_LINE;
         });
     });
 
-    // Remove vehicles that have left the road.
+    // Remove vehicles that have completely left the road.
     vehicles = vehicles.filter(
         vehicle => vehicle.position < ROAD_LENGTH
     );
@@ -211,7 +306,6 @@ function advanceSimulation() {
     updateSignals(counts);
     moveVehicles();
 
-    // Refresh the interface if the project defines this function.
     if (typeof renderSimulation === "function") {
         renderSimulation();
     }
@@ -239,7 +333,7 @@ function stopSimulation() {
     }
 }
 
-// Reset the simulation.
+// Reset the entire simulation.
 function resetSimulation() {
     stopSimulation();
 
@@ -248,8 +342,18 @@ function resetSimulation() {
 
     currentPhase = "NS";
     transition = "GREEN";
+
     phaseSeconds = 0;
     transitionSeconds = 0;
+    overrideSeconds = 0;
+
+    pendingPhase = "NS";
+    overrideAfterClearance = false;
+
+    greenTime = {
+        NS: 0,
+        EW: 0
+    };
 
     signals = {
         North: "GREEN",
@@ -263,12 +367,8 @@ function resetSimulation() {
     }
 }
 
-// Keep a smooth animation loop if the interface uses it.
+// Keep the display animated if supported by the interface.
 function animate(timestamp) {
-    if (lastFrameTime === 0) {
-        lastFrameTime = timestamp;
-    }
-
     lastFrameTime = timestamp;
 
     if (typeof renderSimulation === "function") {
