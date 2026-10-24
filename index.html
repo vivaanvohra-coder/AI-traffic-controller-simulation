@@ -1,0 +1,89 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Traffic Management</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <div>
+            <p class="eyebrow">HCL JIGSAW PROJECT</p>
+            <h1>AI Traffic Control</h1>
+            <p class="subtitle">Adaptive intersection simulation</p>
+        </div>
+        <span class="status"><span class="dot"></span> SYSTEM ONLINE</span>
+    </header>
+
+    <main>
+        <section class="stats">
+            <article class="stat-card">
+                <p>SIMULATION TIME</p>
+                <h2 id="time">0 s</h2>
+            </article>
+            <article class="stat-card">
+                <p>TOTAL VEHICLES</p>
+                <h2 id="vehicles">0</h2>
+            </article>
+            <article class="stat-card">
+                <p>VEHICLES WAITING</p>
+                <h2 id="waiting">0</h2>
+            </article>
+            <article class="stat-card">
+                <p>ACTIVE PHASE</p>
+                <h2 id="phase">North–South</h2>
+            </article>
+        </section>
+
+        <section class="panel">
+            <div class="panel-heading">
+                <div>
+                    <p class="eyebrow">LIVE VISUALISATION</p>
+                    <h2>Four-way intersection</h2>
+                </div>
+                
+                <div class="controls">
+                    <div class="spawn-controls">
+                        <button class="spawn-button" data-approach="North">+ North 🚗</button>
+                        <button class="spawn-button" data-approach="South">+ South 🚗</button>
+                        <button class="spawn-button" data-approach="East">+ East 🚗</button>
+                        <button class="spawn-button" data-approach="West">+ West 🚗</button>
+                    </div>
+                    <button id="step-button">Advance 1 second →</button>
+                    <button id="run-button">▶ Run simulation</button>
+                </div>
+
+            </div>
+
+            <div class="intersection">
+                <div class="road-label north">NORTH <span id="count-North">0 vehicles</span></div>
+                <div class="road-label south">SOUTH <span id="count-South">0 vehicles</span></div>
+                <div class="road-label west">WEST <span id="count-West">0 vehicles</span></div>
+                <div class="road-label east">EAST <span id="count-East">0 vehicles</span></div>
+
+                <div class="road vertical"></div>
+                <div class="road horizontal"></div>
+                <div class="center-lines vertical-lines"></div>
+                <div class="center-lines horizontal-lines"></div>
+
+                <div class="signal signal-n" id="signal-North"><span></span><span></span></div>
+                <div class="signal signal-s" id="signal-South"><span></span><span></span></div>
+                <div class="signal signal-e" id="signal-East"><span></span><span></span></div>
+                <div class="signal signal-w" id="signal-West"><span></span><span></span></div>
+            </div>
+            <p class="hint">Use “Advance 1 second” to run the simulation step by step.</p>
+        </section>
+
+        <section class="panel">
+            <p class="eyebrow">TRAFFIC MONITOR</p>
+            <h2>Approach statistics</h2>
+            <div id="approach-list" class="approach-list"></div>
+        </section>
+    </main>
+
+    <footer>AI Traffic Flow Optimizer · Prototype simulation</footer>
+    <script src="simulation.js"></script>
+</body>
+</html>
