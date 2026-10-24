@@ -1,5 +1,6 @@
+// Browser-only traffic-control simulation.
+// Requires the same HTML element IDs/classes as the original version.
 
- // Browser-only AI Traffic Control prototype for GitHub Pages.
 const approaches = ["North", "South", "East", "West"];
 
 const TICK_MS = 1000;
@@ -12,14 +13,15 @@ const MIN_GREEN = 5;
 const MAX_GREEN = 15;
 const ALL_RED_SECONDS = 5;
 
-const OVERRIDE_LIMIT_SECONDS = 60;
-const EW_OVERRIDE_SECONDS = 30;
+// Fairness rule: after an axis has accumulated 60 seconds of normal
+// green time, the opposite axis gets green for up to 30 seconds.
+const FAIRNESS_LIMIT_SECONDS = 60;
+const FORCED_OPPOSITE_GREEN_SECONDS = 30;
 
 let running = false;
 let timerId = null;
 let elapsedSeconds = 0;
 let nextVehicleId = 1;
-
 let vehicles = [];
 
 let signals = {
@@ -33,16 +35,16 @@ let currentPhase = "NS";
 let phaseSeconds = 0;
 let transition = "GREEN";
 let transitionSeconds = 0;
+let pendingPhase = "NS";
 
-// Fairness override state.
+let forcedGreenAfterClearance = false;
+let forcedGreenSeconds = 0;
+
+// Counts normal green time for each axis since the last fairness override.
 let greenTime = {
     NS: 0,
     EW: 0
 };
-
-let overrideSeconds = 0;
-let pendingPhase = "NS";
-let overrideAfterClearance = false;
 
 const intersection = document.querySelector(".intersection");
 
@@ -52,161 +54,100 @@ let animationStart = 0;
 let displayedStarts = new Map();
 let targetVehicles = [];
 
-// Count vehicles on each approach.
+function phaseForApproach(approach) {
+    return ["North", "South"].includes(approach) ? "NS" : "EW";
+}
+
+function otherPhase(phase) {
+    return phase === "NS" ? "EW" : "NS";
+}
+
+function approachesForPhase(phase) {
+    return phase === "NS"
+        ? ["North", "South"]
+        : ["East", "West"];
+}
+
 function currentCounts() {
     return Object.fromEntries(
-        approaches.map(a => [
-            a,
-            vehicles.filter(v => v.approach === a).length
+        approaches.map((approach) => [
+            approach,
+            vehicles.filter((vehicle) => vehicle.approach === approach).length
         ])
     );
 }
 
-// Count vehicles waiting at the stop line.
 function queueCounts() {
     return Object.fromEntries(
-        approaches.map(a => [
-            a,
-            vehicles.filter(v =>
-                v.approach === a &&
-                v.position <= STOP_LINE &&
-                v.speed === 0
+        approaches.map((approach) => [
+            approach,
+            vehicles.filter(
+                (vehicle) =>
+                    vehicle.approach === approach &&
+                    vehicle.position <= STOP_LINE &&
+                    vehicle.speed === 0
             ).length
         ])
     );
 }
 
-// Return the complete simulation state.
 function getState() {
     return {
         elapsed_seconds: elapsedSeconds,
         traffic_counts: currentCounts(),
         queue_lengths: queueCounts(),
         signals: { ...signals },
-        vehicles: vehicles.map(v => ({ ...v }))
+        vehicles: vehicles.map((vehicle) => ({ ...vehicle }))
     };
 }
 
-// Normal adaptive phase selection.
-// The fairness override prevents one axis from monopolising green.
-function chooseNextPhase(counts) {
-    const ns = counts.North + counts.South;
-    const ew = counts.East + counts.West;
-
-    if (ns === ew) {
-        return currentPhase === "NS" ? "EW" : "NS";
-    }
-
-    return ns > ew ? "NS" : "EW";
+function countForPhase(counts, phase) {
+    const [first, second] = approachesForPhase(phase);
+    return counts[first] + counts[second];
 }
 
-// Check whether any E-W vehicles remain on the simulated roads.
-function hasEWTraffic() {
-    return vehicles.some(v =>
-        v.approach === "East" ||
-        v.approach === "West"
+function hasTrafficForPhase(phase) {
+    const phaseApproaches = approachesForPhase(phase);
+
+    return vehicles.some((vehicle) =>
+        phaseApproaches.includes(vehicle.approach)
     );
 }
 
-// Begin an all-red clearance before changing phases.
-function beginAllRed(nextPhase, isOverride = false) {
+function chooseNextPhase(counts) {
+    const nsCount = countForPhase(counts, "NS");
+    const ewCount = countForPhase(counts, "EW");
+
+    if (nsCount === ewCount) {
+        return otherPhase(currentPhase);
+    }
+
+    return nsCount > ewCount ? "NS" : "EW";
+}
+
+function beginAllRed(nextPhase, startForcedGreen = false) {
+    if (nextPhase === currentPhase && !startForcedGreen) {
+        return;
+    }
+
     transition = "ALL_RED";
     transitionSeconds = 0;
     pendingPhase = nextPhase;
-    overrideAfterClearance = isOverride;
+    forcedGreenAfterClearance = startForcedGreen;
 }
 
-// Activate the E-W fairness override.
-function triggerEWOverride() {
-    // Reset the fairness counters so the same accumulated time
-    // cannot immediately trigger another override.
+function triggerFairnessOverride() {
+    // The axis currently green has used 60 seconds. Reset the cycle
+    // and give the opposite axis a temporary green window.
     greenTime.NS = 0;
     greenTime.EW = 0;
-
     phaseSeconds = 0;
-    overrideSeconds = 0;
+    forcedGreenSeconds = 0;
 
-    if (currentPhase === "EW") {
-        // E-W already has green: extend it as the override.
-        transition = "EW_OVERRIDE";
-        transitionSeconds = 0;
-        overrideAfterClearance = false;
-    } else {
-        // N-S is green: clear the intersection first.
-        beginAllRed("EW", true);
-    }
+    beginAllRed(otherPhase(currentPhase), true);
 }
 
-// Update signal phases and enforce the fairness override.
-function updateSignals(counts) {
-    if (transition === "GREEN") {
-        phaseSeconds++;
-
-        // Count cumulative normal green time for each axis.
-        greenTime[currentPhase]++;
-
-        // FAIRNESS OVERRIDE:
-        // If either axis exceeds 60 seconds, prioritise E-W.
-        if (
-            greenTime.NS > OVERRIDE_LIMIT_SECONDS ||
-            greenTime.EW > OVERRIDE_LIMIT_SECONDS
-        ) {
-            triggerEWOverride();
-        } else {
-            const isNS = currentPhase === "NS";
-
-            const active = isNS
-                ? counts.North + counts.South
-                : counts.East + counts.West;
-
-            const waiting = isNS
-                ? counts.East + counts.West
-                : counts.North + counts.South;
-
-            // Normal adaptive switching.
-            if (
-                phaseSeconds >= MAX_GREEN ||
-                (
-                    phaseSeconds >= MIN_GREEN &&
-                    waiting > active
-                )
-            ) {
-                beginAllRed(chooseNextPhase(counts));
-            }
-        }
-    } else if (transition === "ALL_RED") {
-        // Every signal remains red during clearance.
-        transitionSeconds++;
-
-        if (transitionSeconds >= ALL_RED_SECONDS) {
-            currentPhase = pendingPhase;
-
-            phaseSeconds = 0;
-            transitionSeconds = 0;
-
-            if (overrideAfterClearance) {
-                // Start the guaranteed E-W priority window.
-                transition = "EW_OVERRIDE";
-                overrideSeconds = 0;
-                overrideAfterClearance = false;
-            } else {
-                transition = "GREEN";
-            }
-        }
-    } else if (transition === "EW_OVERRIDE") {
-        // E-W retains green until its traffic clears or 30 seconds pass.
-        overrideSeconds++;
-
-        if (
-            overrideSeconds >= EW_OVERRIDE_SECONDS ||
-            !hasEWTraffic()
-        ) {
-            // Return to N-S after a complete 5-second clearance.
-            beginAllRed("NS");
-        }
-    }
-
-    // Apply signal states AFTER all transition decisions.
+function applySignalStates() {
     if (transition === "ALL_RED") {
         signals = {
             North: "RED",
@@ -214,38 +155,104 @@ function updateSignals(counts) {
             East: "RED",
             West: "RED"
         };
-    } else if (
-        transition === "EW_OVERRIDE" ||
-        currentPhase === "EW"
-    ) {
-        signals = {
-            North: "RED",
-            South: "RED",
-            East: "GREEN",
-            West: "GREEN"
-        };
-    } else {
+        return;
+    }
+
+    if (currentPhase === "NS") {
         signals = {
             North: "GREEN",
             South: "GREEN",
             East: "RED",
             West: "RED"
         };
+        return;
     }
+
+    signals = {
+        North: "RED",
+        South: "RED",
+        East: "GREEN",
+        West: "GREEN"
+    };
 }
 
-// Spawn a vehicle using the original interface function.
-function spawnVehicle(approach) {
-    if (!approaches.includes(approach)) return;
+function updateSignals(counts) {
+    if (transition === "GREEN") {
+        phaseSeconds += 1;
+        greenTime[currentPhase] += 1;
 
-    if (
-        vehicles.some(v =>
-            v.approach === approach &&
-            v.position < CAR_GAP
-        )
-    ) {
+        // The current axis has had 60 seconds of normal green time.
+        // Give the OTHER axis green next.
+        if (greenTime[currentPhase] >= FAIRNESS_LIMIT_SECONDS) {
+            triggerFairnessOverride();
+        } else {
+            const activeTraffic = countForPhase(counts, currentPhase);
+            const waitingTraffic = countForPhase(
+                counts,
+                otherPhase(currentPhase)
+            );
+
+            const shouldConsiderSwitch =
+                phaseSeconds >= MAX_GREEN ||
+                (
+                    phaseSeconds >= MIN_GREEN &&
+                    waitingTraffic > activeTraffic
+                );
+
+            if (shouldConsiderSwitch) {
+                const nextPhase = chooseNextPhase(counts);
+
+                if (nextPhase !== currentPhase) {
+                    beginAllRed(nextPhase);
+                }
+            }
+        }
+    } else if (transition === "ALL_RED") {
+        transitionSeconds += 1;
+
+        if (transitionSeconds >= ALL_RED_SECONDS) {
+            currentPhase = pendingPhase;
+            phaseSeconds = 0;
+            transitionSeconds = 0;
+
+            if (forcedGreenAfterClearance) {
+                transition = "FORCED_GREEN";
+                forcedGreenSeconds = 0;
+                forcedGreenAfterClearance = false;
+            } else {
+                transition = "GREEN";
+            }
+        }
+    } else if (transition === "FORCED_GREEN") {
+        forcedGreenSeconds += 1;
+
+        // End the temporary green after 30 seconds OR as soon as all
+        // vehicles on this axis have left the simulated roads.
+        if (
+            forcedGreenSeconds >= FORCED_OPPOSITE_GREEN_SECONDS ||
+            !hasTrafficForPhase(currentPhase)
+        ) {
+            beginAllRed(otherPhase(currentPhase));
+        }
+    }
+
+    applySignalStates();
+}
+
+function spawnVehicle(approach) {
+    if (!approaches.includes(approach)) {
+        return;
+    }
+
+    const roadIsBlocked = vehicles.some(
+        (vehicle) =>
+            vehicle.approach === approach &&
+            vehicle.position < CAR_GAP
+    );
+
+    if (roadIsBlocked) {
         alert(
-            `Not enough space on ${approach}. Advance the simulation to make room.`
+            `Not enough space on ${approach}. Advance the simulation first.`
         );
         return;
     }
@@ -261,65 +268,62 @@ function spawnVehicle(approach) {
     renderState(getState());
 }
 
-// Advance vehicles without crossing a red signal.
 function advanceSimulation() {
     updateSignals(currentCounts());
 
     for (const approach of approaches) {
         const cars = vehicles
-            .filter(v => v.approach === approach)
-            .sort((a, b) => b.position - a.position);
+            .filter((vehicle) => vehicle.approach === approach)
+            .sort((first, second) => second.position - first.position);
 
-        let front = Infinity;
+        let frontPosition = Infinity;
 
-        for (const v of cars) {
-            const old = v.position;
+        for (const vehicle of cars) {
+            const oldPosition = vehicle.position;
             const green = signals[approach] === "GREEN";
 
-            let next = Math.min(
-                old + VEHICLE_SPEED,
+            let nextPosition = Math.min(
+                oldPosition + VEHICLE_SPEED,
                 ROAD_LENGTH
             );
 
-            // Maintain spacing from the vehicle ahead.
-            if (front !== Infinity) {
-                next = Math.min(next, front - CAR_GAP);
+            if (frontPosition !== Infinity) {
+                nextPosition = Math.min(
+                    nextPosition,
+                    frontPosition - CAR_GAP
+                );
             }
 
-            // Stop at the stop line on red or during clearance.
-            if (!green && old <= STOP_LINE) {
-                next = Math.min(next, STOP_LINE);
+            if (!green && oldPosition <= STOP_LINE) {
+                nextPosition = Math.min(nextPosition, STOP_LINE);
             }
 
-            // Never move a vehicle backwards.
-            next = Math.max(old, next);
+            nextPosition = Math.max(oldPosition, nextPosition);
 
-            v.position = next;
-            v.speed = next > old ? VEHICLE_SPEED : 0;
+            vehicle.position = nextPosition;
+            vehicle.speed =
+                nextPosition > oldPosition ? VEHICLE_SPEED : 0;
 
             if (
-                v.speed === 0 &&
-                old <= STOP_LINE &&
+                vehicle.speed === 0 &&
+                oldPosition <= STOP_LINE &&
                 !green
             ) {
-                v.waiting_seconds++;
+                vehicle.waiting_seconds += 1;
             }
 
-            front = v.position;
+            frontPosition = vehicle.position;
         }
     }
 
-    // Remove vehicles that have exited the road.
     vehicles = vehicles.filter(
-        v => v.position < ROAD_LENGTH
+        (vehicle) => vehicle.position < ROAD_LENGTH
     );
 
-    elapsedSeconds++;
-
+    elapsedSeconds += 1;
     renderState(getState());
 }
 
-// Render dashboard statistics, lights, and vehicles.
 function renderState(state) {
     const counts = state.traffic_counts;
     const queues = state.queue_lengths;
@@ -328,10 +332,10 @@ function renderState(state) {
         `${state.elapsed_seconds} s`;
 
     document.getElementById("vehicles").textContent =
-        Object.values(counts).reduce((a, b) => a + b, 0);
+        Object.values(counts).reduce((total, count) => total + count, 0);
 
     document.getElementById("waiting").textContent =
-        Object.values(queues).reduce((a, b) => a + b, 0);
+        Object.values(queues).reduce((total, count) => total + count, 0);
 
     const nsGreen =
         state.signals.North === "GREEN" ||
@@ -348,55 +352,55 @@ function renderState(state) {
                 ? "East–West"
                 : "All Red";
 
-    approaches.forEach(a => {
-        document.getElementById(`count-${a}`).textContent =
-            `${counts[a]} vehicles`;
+    approaches.forEach((approach) => {
+        document.getElementById(`count-${approach}`).textContent =
+            `${counts[approach]} vehicles`;
 
-        const light = document.getElementById(`signal-${a}`);
-
-        light.classList.toggle(
-            "green",
-            state.signals[a] === "GREEN"
+        const signal = document.getElementById(
+            `signal-${approach}`
         );
 
-        light.classList.toggle(
+        signal.classList.toggle(
+            "green",
+            state.signals[approach] === "GREEN"
+        );
+
+        signal.classList.toggle(
             "red",
-            state.signals[a] !== "GREEN"
+            state.signals[approach] !== "GREEN"
         );
     });
 
     document.getElementById("approach-list").innerHTML =
-        approaches.map(a => `
+        approaches.map((approach) => `
             <article class="approach">
-                <h3>${a}</h3>
-                <p>Vehicles: <strong>${counts[a]}</strong></p>
-                <p>Waiting: <strong>${queues[a]}</strong></p>
-                <p>Signal: <strong>${state.signals[a]}</strong></p>
+                <h3>${approach}</h3>
+                <p>Vehicles: <strong>${counts[approach]}</strong></p>
+                <p>Waiting: <strong>${queues[approach]}</strong></p>
+                <p>Signal: <strong>${state.signals[approach]}</strong></p>
             </article>
         `).join("");
 
     renderVehicles(state.vehicles);
 }
 
-// Convert vehicle position into intersection coordinates.
 function getCoordinates(approach, position) {
-    const p = Math.max(0, Math.min(100, position));
+    const progress = Math.max(0, Math.min(100, position));
 
     switch (approach) {
         case "North":
-            return { left: 43, top: p };
+            return { left: 43, top: progress };
         case "South":
-            return { left: 54, top: 100 - p };
+            return { left: 54, top: 100 - progress };
         case "West":
-            return { left: p, top: 38 };
+            return { left: progress, top: 38 };
         case "East":
-            return { left: 100 - p, top: 56 };
+            return { left: 100 - progress, top: 56 };
         default:
             return { left: 50, top: 50 };
     }
 }
 
-// Read the current displayed vehicle position.
 function readDisplayedPosition(car) {
     const approach = car.dataset.approach;
     const left = parseFloat(car.style.left);
@@ -413,11 +417,10 @@ function readDisplayedPosition(car) {
     return 100 - left;
 }
 
-// Render and animate vehicles using the original system.
 function renderVehicles(items) {
     const starts = new Map();
 
-    intersection.querySelectorAll(".vehicle").forEach(car => {
+    intersection.querySelectorAll(".vehicle").forEach((car) => {
         const id = Number(car.dataset.vehicleId);
         const position = readDisplayedPosition(car);
 
@@ -426,27 +429,30 @@ function renderVehicles(items) {
         }
     });
 
-    targetVehicles = items.map(v => ({ ...v }));
+    targetVehicles = items.map((vehicle) => ({ ...vehicle }));
     displayedStarts = new Map();
 
-    const ids = new Set();
+    const vehicleIds = new Set();
 
-    targetVehicles.forEach(v => {
-        ids.add(v.id);
+    targetVehicles.forEach((vehicle) => {
+        vehicleIds.add(vehicle.id);
 
         let car = intersection.querySelector(
-            `[data-vehicle-id="${v.id}"]`
+            `[data-vehicle-id="${vehicle.id}"]`
         );
 
         if (!car) {
             car = document.createElement("div");
             car.className =
-                `vehicle vehicle-${v.approach.toLowerCase()}`;
+                `vehicle vehicle-${vehicle.approach.toLowerCase()}`;
 
-            car.dataset.vehicleId = v.id;
-            car.dataset.approach = v.approach;
+            car.dataset.vehicleId = vehicle.id;
+            car.dataset.approach = vehicle.approach;
 
-            const start = getCoordinates(v.approach, v.position);
+            const start = getCoordinates(
+                vehicle.approach,
+                vehicle.position
+            );
 
             car.style.left = `${start.left}%`;
             car.style.top = `${start.top}%`;
@@ -455,13 +461,15 @@ function renderVehicles(items) {
         }
 
         displayedStarts.set(
-            v.id,
-            starts.has(v.id) ? starts.get(v.id) : v.position
+            vehicle.id,
+            starts.has(vehicle.id)
+                ? starts.get(vehicle.id)
+                : vehicle.position
         );
     });
 
-    intersection.querySelectorAll(".vehicle").forEach(car => {
-        if (!ids.has(Number(car.dataset.vehicleId))) {
+    intersection.querySelectorAll(".vehicle").forEach((car) => {
+        if (!vehicleIds.has(Number(car.dataset.vehicleId))) {
             car.remove();
         }
     });
@@ -474,40 +482,53 @@ function renderVehicles(items) {
     animationFrame = requestAnimationFrame(animateVehiclesSmooth);
 }
 
-// Smoothly animate vehicles between simulation ticks.
 function animateVehiclesSmooth() {
     const elapsed = performance.now() - animationStart;
     const linear = Math.min(1, elapsed / ANIMATION_MS);
     const progress = linear * linear * (3 - 2 * linear);
 
-    targetVehicles.forEach(v => {
+    targetVehicles.forEach((vehicle) => {
         const car = intersection.querySelector(
-            `[data-vehicle-id="${v.id}"]`
+            `[data-vehicle-id="${vehicle.id}"]`
         );
 
-        if (!car) return;
+        if (!car) {
+            return;
+        }
 
-        const from = displayedStarts.get(v.id) ?? v.position;
-        const position = from + (v.position - from) * progress;
-        const c = getCoordinates(v.approach, position);
+        const startPosition =
+            displayedStarts.get(vehicle.id) ?? vehicle.position;
 
-        car.style.left = `${c.left}%`;
-        car.style.top = `${c.top}%`;
+        const position =
+            startPosition +
+            (vehicle.position - startPosition) * progress;
+
+        const coordinates = getCoordinates(
+            vehicle.approach,
+            position
+        );
+
+        car.style.left = `${coordinates.left}%`;
+        car.style.top = `${coordinates.top}%`;
 
         car.title =
-            `${v.approach} vehicle #${v.id} — position ${position.toFixed(1)}`;
+            `${vehicle.approach} vehicle #${vehicle.id} — ` +
+            `position ${position.toFixed(1)}`;
     });
 
     if (linear < 1) {
-        animationFrame = requestAnimationFrame(animateVehiclesSmooth);
+        animationFrame = requestAnimationFrame(
+            animateVehiclesSmooth
+        );
     } else {
         animationFrame = null;
     }
 }
 
-// Start using the original button and timer architecture.
 function startSimulation() {
-    if (running) return;
+    if (running) {
+        return;
+    }
 
     running = true;
 
@@ -531,7 +552,9 @@ function stopSimulation() {
 }
 
 function runNextTick() {
-    if (!running) return;
+    if (!running) {
+        return;
+    }
 
     advanceSimulation();
 
@@ -540,7 +563,6 @@ function runNextTick() {
     }
 }
 
-// Preserve the original interface event listeners.
 document.getElementById("run-button").addEventListener(
     "click",
     () => running ? stopSimulation() : startSimulation()
@@ -549,20 +571,17 @@ document.getElementById("run-button").addEventListener(
 document.getElementById("step-button").addEventListener(
     "click",
     () => {
-        if (!running) advanceSimulation();
+        if (!running) {
+            advanceSimulation();
+        }
     }
 );
 
-document.querySelectorAll(".spawn-button").forEach(button => {
+document.querySelectorAll(".spawn-button").forEach((button) => {
     button.addEventListener(
         "click",
         () => spawnVehicle(button.dataset.approach)
     );
 });
 
-// Initialise the interface.
 renderState(getState());
-
-if (typeof requestAnimationFrame === "function") {
-    animationFrame = requestAnimationFrame(animate);
-}
